@@ -392,7 +392,6 @@ def main() -> None:
 
     target_dir = args.target_dir or meta.get("target_subdir") or DEFAULT_TARGET_DIR
     md_dir = KNOWLEDGE / target_dir
-    md_dir.mkdir(parents=True, exist_ok=True)
 
     md_filename = slug + ".md"
     md_path = md_dir / md_filename
@@ -401,6 +400,28 @@ def main() -> None:
     if meta["dedup_decision"] == "conflict_with":
         md_path = md_dir / f"_conflict_{slug}-{date.today().isoformat()}.md"
 
+    if args.dry_run:
+        # Emit structured proposal so callers (kb-bot) can render previews
+        # without re-running the analysis. No image download, no write.
+        print(json.dumps({
+            "ok": True,
+            "dry_run": True,
+            "target_path": str(md_path.relative_to(REPO)),
+            "title": meta["title"],
+            "decision": meta["dedup_decision"],
+            "decision_reason": meta.get("dedup_reason", ""),
+            "dedup_target": meta.get("dedup_target"),
+            "max_similarity": dedup["max_score"],
+            "tags": meta["tags"],
+            "level": meta.get("level", "internal"),
+            "summary": meta.get("summary", ""),
+            "key_points": meta.get("key_points") or [],
+            "source_url": args.url,
+            "source_doc_id": doc_id,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    md_dir.mkdir(parents=True, exist_ok=True)
     media_dir = md_dir / "_media" / slug
 
     print(f"→ Downloading embedded images → {media_dir}", file=sys.stderr)
@@ -409,11 +430,6 @@ def main() -> None:
 
     fm = build_frontmatter(meta, args.url, doc_id, args.uploaded_by)
     full = fm + body
-
-    if args.dry_run:
-        print("--- DRY RUN: would write to", md_path, "---")
-        print(full[:1500])
-        return
 
     md_path.write_text(full, encoding="utf-8")
     print(f"→ Wrote {md_path}", file=sys.stderr)
