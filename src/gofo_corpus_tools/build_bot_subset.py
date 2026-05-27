@@ -55,6 +55,9 @@ def select_files(knowledge: Path, scope: dict) -> list[Path]:
         if pat.endswith("/**"):
             pat = pat + "/*"
         candidates.update(p for p in knowledge.glob(pat) if p.is_file())
+    # Hard-exclude _archive/ — source-organized history, not for downstream bots.
+    candidates = {p for p in candidates
+                  if "_archive" not in p.relative_to(knowledge).parts}
 
     selected: list[Path] = []
     for p in sorted(candidates):

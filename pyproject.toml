@@ -22,6 +22,7 @@ ingest = [
 [project.scripts]
 corpus-ingest = "gofo_corpus_tools.ingest:main"
 corpus-build-subsets = "gofo_corpus_tools.build_bot_subset:main"
+corpus-distill = "gofo_corpus_tools.distill:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
