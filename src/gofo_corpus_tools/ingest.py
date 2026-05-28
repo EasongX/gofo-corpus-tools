@@ -367,7 +367,13 @@ def main() -> None:
     global REPO, KNOWLEDGE, DATA
 
     ap = argparse.ArgumentParser(prog="corpus-ingest")
-    ap.add_argument("url")
+    ap.add_argument("url", nargs="?", default=None,
+                    help="Feishu doc/wiki URL (omit when using --from-md)")
+    ap.add_argument("--from-md", type=Path, default=None,
+                    help="Read body from a local markdown file instead of fetching "
+                         "from Feishu. Requires --title.")
+    ap.add_argument("--title", default=None,
+                    help="Title for --from-md mode (used as the doc title)")
     ap.add_argument("--repo", type=Path, default=None,
                     help="Corpus repo root. Default: walk up from cwd.")
     ap.add_argument("--uploaded-by", default="unknown")
@@ -378,6 +384,11 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
+    if not args.url and not args.from_md:
+        sys.exit("must provide either <url> or --from-md FILE")
+    if args.from_md and not args.title:
+        sys.exit("--from-md requires --title 'doc title'")
+
     REPO = (args.repo.resolve() if args.repo else find_repo_root())
     KNOWLEDGE = REPO / "knowledge"
     DATA = REPO / "data"
@@ -386,11 +397,22 @@ def main() -> None:
     DATA.mkdir(exist_ok=True)
 
     print(f"→ Repo: {REPO}", file=sys.stderr)
-    print(f"→ Fetching {args.url}", file=sys.stderr)
-    doc = fetch_doc(args.url)
-    raw = doc["content"]
-    doc_id = doc["document_id"]
-    title_hint = extract_title(raw)
+    if args.from_md:
+        # Local-markdown path: skip Feishu fetch.
+        print(f"→ Reading local markdown: {args.from_md}", file=sys.stderr)
+        body_md = args.from_md.read_text(encoding="utf-8")
+        title_hint = args.title
+        # Synthesize "raw" so downstream code (which strips <title>) stays uniform
+        raw = f"<title>{title_hint}</title>\n\n{body_md}"
+        doc_id = f"file:{hashlib.sha256(body_md.encode()).hexdigest()[:12]}"
+        source_url = args.url or f"file:{args.from_md.name}"
+    else:
+        print(f"→ Fetching {args.url}", file=sys.stderr)
+        doc = fetch_doc(args.url)
+        raw = doc["content"]
+        doc_id = doc["document_id"]
+        title_hint = extract_title(raw)
+        source_url = args.url
     slug = slugify(title_hint)
 
     print(f"→ Title: {title_hint!r}; slug={slug}", file=sys.stderr)
@@ -406,7 +428,7 @@ def main() -> None:
     meta = claude_judge_and_frontmatter(
         title_hint=title_hint,
         body=body_only,
-        source_url=args.url,
+        source_url=source_url,
         uploaded_by=args.uploaded_by,
         dedup=dedup,
         level_override=args.level,
@@ -448,7 +470,7 @@ def main() -> None:
             "level": meta.get("level", "internal"),
             "summary": meta.get("summary", ""),
             "key_points": meta.get("key_points") or [],
-            "source_url": args.url,
+            "source_url": source_url,
             "source_doc_id": doc_id,
         }, ensure_ascii=False, indent=2))
         return
@@ -459,7 +481,7 @@ def main() -> None:
     body, n_images = process_content(raw, media_dir, md_dir)
     print(f"  {n_images} image(s) downloaded", file=sys.stderr)
 
-    fm = build_frontmatter(meta, args.url, doc_id, args.uploaded_by)
+    fm = build_frontmatter(meta, source_url, doc_id, args.uploaded_by)
     full = fm + body
 
     md_path.write_text(full, encoding="utf-8")
@@ -471,7 +493,7 @@ def main() -> None:
 
     commit_msg = (
         f"learn: {meta['title']} (from {args.uploaded_by})\n\n"
-        f"source: {args.url}\n"
+        f"source: {source_url}\n"
         f"dedup: {meta['dedup_decision']}"
         + (f" → {meta['dedup_target']}" if meta.get("dedup_target") else "")
     )
