@@ -318,9 +318,11 @@ def write_distilled(repo: Path, plan: dict, archive: bool = True) -> dict:
         out_path.write_text(_render_topic_md(topic, today), encoding="utf-8")
         written.append(str(out_path.relative_to(repo)))
 
-    # Archive original sources (skip _archive itself, skip topic files we just wrote)
+    # Archive original sources to <repo>/raw/sources/ (parser-friendly Karpathy
+    # pattern: raw/ at repo root holds source-only metadata nodes, distinct
+    # from knowledge/ which holds article scan).
     if archive:
-        archive_root = knowledge / "_archive" / "sources"
+        archive_root = repo / "raw" / "sources"
         archive_root.mkdir(parents=True, exist_ok=True)
         topic_paths = {Path(p) for p in written}
         for path in sorted(knowledge.rglob("*.md")):
