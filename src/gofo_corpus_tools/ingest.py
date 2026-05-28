@@ -249,6 +249,7 @@ def claude_judge_and_frontmatter(
     dedup: dict,
     level_override: str | None,
     target_subdirs_hint: list[str],
+    user_hint: str = "",
 ) -> dict:
     from anthropic import Anthropic
 
@@ -279,6 +280,11 @@ def claude_judge_and_frontmatter(
     )
     target_options = " | ".join(repr(s) for s in target_subdirs_hint) or "'shared' | 'ops'"
 
+    user_hint_block = (
+        f"\n**USER HINT (the teammate's instructions about this doc — "
+        f"FOLLOW THIS over your default classification)**:\n{user_hint}\n"
+    ) if user_hint.strip() else ""
+
     prompt = f"""You analyze a Lark/Feishu doc that a teammate just submitted to a team
 knowledge base and produce metadata + a duplicate/conflict judgment.
 
@@ -286,7 +292,7 @@ NEW DOC (title hint: {title_hint!r}):
 ---
 {body_excerpt}
 ---
-
+{user_hint_block}
 TOP RELEVANT EXISTING CHUNKS (max similarity: {dedup['max_score']:.2f}):
 ---
 {hits_text}
@@ -381,6 +387,10 @@ def main() -> None:
                     help="Override Claude's choice of target subdir")
     ap.add_argument("--level", choices=sorted(VALID_LEVELS), default=None,
                     help="Force sensitivity level; otherwise Claude classifies.")
+    ap.add_argument("--hint", default="",
+                    help="User's instruction about this doc (e.g. 'only extract "
+                         "metric calc rules; put under 2x_操作运输'). Claude "
+                         "follows this over its default classification.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -433,6 +443,7 @@ def main() -> None:
         dedup=dedup,
         level_override=args.level,
         target_subdirs_hint=list_target_subdirs(),
+        user_hint=args.hint,
     )
     if args.level:
         meta["level"] = args.level
