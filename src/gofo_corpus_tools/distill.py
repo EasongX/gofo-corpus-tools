@@ -29,7 +29,7 @@ from typing import Any
 
 import yaml
 
-from .ingest import find_repo_root
+from .ingest import find_repo_root, next_line_seq
 
 MODEL = "claude-opus-4-7"
 MAX_OUTPUT_TOKENS = 64000  # opus-4-7 cap; we emit many topic bodies in one call
@@ -88,8 +88,21 @@ Coverage rules:
    topic files; cross-reference: `see [vpn.md]`.
 3. Inline citation after each substantive paragraph or list block:
    `[来源: <source-path>]`.
-4. Topic slug: short kebab-case English (e.g. "vpn", "pod-standard").
-5. Default area "ops" unless clearly shared/.
+4. Topic slug: short snake_case English (underscore-separated; lowercase).
+   Examples: "vpn", "pod_standard", "driver_signin_signout".
+5. Area = the business-line directory name. Available lines (pick one):
+   - "0x_总览"          — 业务全景 / 术语表 / 组织架构
+   - "1x_收派作业"      — 揽收 / 派送 / POD / 司机 / 面单
+   - "2x_操作运输"      — 中心 SOP / 集包 / 站点 / 退件
+   - "3x_客服指控"      — PDA 轨迹问题 / 异常上报
+   - "4x_BI数分"        — BI / 数据分析
+   - "5x_市场客户"      — 市场 / 客户管理
+   - "6x_管理工具"      — 账号 / 权限 / 系统申请
+   - "7x_财务结算"      — 报销 / 结算
+   - "9x_跨业务共享"    — 地址经验库 / 异常码表 等多线复用
+   Filename prefix (10_, 11_, ...) is assigned mechanically by the writer
+   based on existing files in the chosen area — don't include it in your
+   output slug.
 6. Aim for 10–18 topics. Don't over-fragment; don't under-fragment.
 
 Voice & style (CRITICAL — these docs are read by ops/IT staff in a hurry,
@@ -149,16 +162,16 @@ def _build_distill_prompt(sources: list[dict]) -> str:
 ===TAXONOMY===
 - slug: vpn
   title: VPN 申请与使用
-  area: ops
-- slug: pod-standard
+  area: 6x_管理工具
+- slug: pod_standard
   title: POD 拍照标准
-  area: ops
+  area: 1x_收派作业
 - ... (all topics)
 ===END===
 
 ===TOPIC vpn===
 title: VPN 申请与使用
-area: ops
+area: 6x_管理工具
 tags: ops, faq, it, vpn
 level: internal
 summary: 一两句概述（中文，可含「」引号但避免 ASCII " 引号）
@@ -273,7 +286,9 @@ def parse_delimited(text: str) -> dict:
 
 
 def _topic_filename(slug: str) -> str:
-    safe = re.sub(r"[^a-z0-9-]+", "-", slug.lower()).strip("-") or "untitled"
+    """Underscore convention. Caller is responsible for prepending the
+    business-line numbered prefix (handled in write_distilled)."""
+    safe = re.sub(r"[^a-z0-9_]+", "_", slug.lower()).strip("_") or "untitled"
     return safe + ".md"
 
 
@@ -310,11 +325,17 @@ def write_distilled(repo: Path, plan: dict, archive: bool = True) -> dict:
     written: list[str] = []
     archived: list[str] = []
 
-    # Write each topic file
+    # Write each topic file. Assign business-line numbered prefix (10_, 11_, ...)
+    # the same way ingest.next_line_seq does it. If area name doesn't match the
+    # <N>x_ pattern (e.g. legacy 'ops'), no prefix is added — file goes in raw.
     for topic in plan.get("topics", []):
         area = topic.get("area") or "ops"
-        out_path = knowledge / area / _topic_filename(topic["slug"])
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        area_dir = knowledge / area
+        area_dir.mkdir(parents=True, exist_ok=True)
+        base = _topic_filename(topic["slug"])
+        seq = next_line_seq(area_dir)
+        fname = f"{seq}_{base}" if seq else base
+        out_path = area_dir / fname
         out_path.write_text(_render_topic_md(topic, today), encoding="utf-8")
         written.append(str(out_path.relative_to(repo)))
 

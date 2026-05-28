@@ -116,9 +116,36 @@ def extract_title(content: str) -> str:
 
 
 def slugify(title: str) -> str:
-    s = re.sub(r"[\s\\/]+", "-", title.strip())
+    """Underscore-separated slug. Convention: knowledge/<line>/<NN>_<slug>.md
+    uses underscore everywhere, so slug itself shouldn't introduce hyphens."""
+    s = re.sub(r"[\s\\/-]+", "_", title.strip())
     s = re.sub(r"[<>:\"|?*]", "", s)
+    s = re.sub(r"_+", "_", s).strip("_")
     return s[:80] or "untitled"
+
+
+def next_line_seq(line_dir: Path) -> str:
+    """Compute next <line><seq> prefix for a new file in a business-line dir.
+
+    Line dirs are named like '1x_收派作业'. The seq within a line starts at 0:
+      first file = '10', second = '11', ..., tenth = '19', eleventh = '110'
+      (no carry to 20, which belongs to line 2). Returns '' if dir name is
+      not a recognized line (e.g. '_archive') — caller skips the prefix.
+    """
+    name = line_dir.name
+    m = re.match(r"^(\d)x_", name)
+    if not m:
+        return ""
+    line_prefix = m.group(1)
+    used: set[int] = set()
+    for p in line_dir.glob("*.md"):
+        m2 = re.match(rf"^{line_prefix}(\d+)_", p.name)
+        if m2:
+            used.add(int(m2.group(1)))
+    seq = 0
+    while seq in used:
+        seq += 1
+    return f"{line_prefix}{seq}"
 
 
 def download_image(url: str, out_dir: Path, index: int) -> Path:
@@ -392,13 +419,18 @@ def main() -> None:
 
     target_dir = args.target_dir or meta.get("target_subdir") or DEFAULT_TARGET_DIR
     md_dir = KNOWLEDGE / target_dir
+    md_dir.mkdir(parents=True, exist_ok=True)
 
-    md_filename = slug + ".md"
-    md_path = md_dir / md_filename
+    # Auto-prepend business-line numbered prefix (e.g. '16_' for the 7th file
+    # in 1x_收派作业). Skips if target_dir doesn't match the <N>x_ pattern.
+    seq_prefix = next_line_seq(md_dir)
+    fname_core = f"{seq_prefix}_{slug}" if seq_prefix else slug
+
+    md_path = md_dir / f"{fname_core}.md"
     if md_path.exists() and meta["dedup_decision"] == "new":
-        md_path = md_dir / f"{slug}-{date.today().isoformat()}.md"
+        md_path = md_dir / f"{fname_core}_{date.today().isoformat()}.md"
     if meta["dedup_decision"] == "conflict_with":
-        md_path = md_dir / f"_conflict_{slug}-{date.today().isoformat()}.md"
+        md_path = md_dir / f"_conflict_{fname_core}_{date.today().isoformat()}.md"
 
     if args.dry_run:
         # Emit structured proposal so callers (kb-bot) can render previews
@@ -421,7 +453,6 @@ def main() -> None:
         }, ensure_ascii=False, indent=2))
         return
 
-    md_dir.mkdir(parents=True, exist_ok=True)
     media_dir = md_dir / "_media" / slug
 
     print(f"→ Downloading embedded images → {media_dir}", file=sys.stderr)
