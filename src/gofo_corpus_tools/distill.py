@@ -292,29 +292,26 @@ def _topic_filename(slug: str) -> str:
     return safe + ".md"
 
 
-def _render_topic_md(topic: dict, today: str) -> str:
-    """Render a topic dict into a markdown file (frontmatter + body)."""
-    tags = topic.get("tags") or []
-    tags_str = "[" + ", ".join(tags) + "]"
-    key_points = topic.get("key_points") or []
-    kp_yaml = "\n".join(f"  - {p}" for p in key_points) if key_points else ""
-    sources_yaml = "\n".join(
-        f"  - file: {s!r}\n    distilled_at: {today}" for s in (topic.get("sources") or [])
-    ) or "  []"
+def _render_topic_md(topic: dict, today: str, topic_slug: str | None = None) -> str:
+    """Render a topic dict into a markdown file (frontmatter + body).
 
-    fm = (
-        "---\n"
-        f"title: {topic['title']}\n"
-        f"topic_slug: {topic['slug']}\n"
-        f"area: {topic.get('area', 'ops')}\n"
-        f"tags: {tags_str}\n"
-        f"level: {topic.get('level', 'internal')}\n"
-        f"distilled_date: {today}\n"
-        f"last_updated: {today}\n"
-        f"summary: {json.dumps(topic.get('summary', ''), ensure_ascii=False)}\n"
-        + (f"key_points:\n{kp_yaml}\n" if key_points else "")
-        + f"sources:\n{sources_yaml}\n"
-        + "---\n\n"
+    topic_slug should be the actual filename stem (with NN_ prefix); falls
+    back to the raw slug if not provided.
+    """
+    from .frontmatter import make_frontmatter
+    fm = make_frontmatter(
+        title=topic["title"],
+        topic_slug=topic_slug or topic["slug"],
+        area=topic.get("area", "ops"),
+        tags=topic.get("tags") or [],
+        level=topic.get("level", "internal"),
+        summary=topic.get("summary", ""),
+        key_points=topic.get("key_points") or [],
+        source="distilled",
+        uploaded_by="corpus-distill",
+        learned_date=today,
+        last_updated=today,
+        sources=[{"file": s, "distilled_at": today} for s in (topic.get("sources") or [])],
     )
     return fm + (topic.get("body") or "").rstrip() + "\n"
 
@@ -336,7 +333,10 @@ def write_distilled(repo: Path, plan: dict, archive: bool = True) -> dict:
         seq = next_line_seq(area_dir)
         fname = f"{seq}_{base}" if seq else base
         out_path = area_dir / fname
-        out_path.write_text(_render_topic_md(topic, today), encoding="utf-8")
+        out_path.write_text(
+            _render_topic_md(topic, today, topic_slug=out_path.stem),
+            encoding="utf-8",
+        )
         written.append(str(out_path.relative_to(repo)))
 
     # Archive original sources to <repo>/raw/sources/ (parser-friendly Karpathy

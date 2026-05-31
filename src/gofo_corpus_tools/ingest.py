@@ -344,23 +344,22 @@ def list_target_subdirs() -> list[str]:
     return out
 
 
-def build_frontmatter(meta: dict, source_url: str, source_doc_id: str, uploaded_by: str) -> str:
-    today = date.today().isoformat()
-    tags_str = "[" + ", ".join(meta["tags"]) + "]"
-    kp = "\n".join(f"  - {p}" for p in meta["key_points"])
-    level = meta.get("level") if meta.get("level") in VALID_LEVELS else "internal"
-    return (
-        "---\n"
-        f"title: {meta['title']}\n"
-        f"tags: {tags_str}\n"
-        f"level: {level}\n"
-        f"source: {source_url}\n"
-        f"source_doc_id: {source_doc_id}\n"
-        f"learned_date: {today}\n"
-        f"uploaded_by: {uploaded_by}\n"
-        f"summary: {json.dumps(meta['summary'], ensure_ascii=False)}\n"
-        f"key_points:\n{kp}\n"
-        "---\n\n"
+def build_frontmatter(meta: dict, source_url: str, source_doc_id: str,
+                      uploaded_by: str, *, topic_slug: str = "", area: str = "") -> str:
+    from .frontmatter import make_frontmatter
+    src = source_url
+    if source_doc_id:
+        src = f"{source_url} (doc_id={source_doc_id})" if source_url else source_doc_id
+    return make_frontmatter(
+        title=meta["title"],
+        topic_slug=topic_slug,
+        area=area,
+        tags=meta.get("tags") or [],
+        level=meta.get("level", "internal"),
+        summary=meta.get("summary", ""),
+        key_points=meta.get("key_points") or [],
+        source=src,
+        uploaded_by=uploaded_by,
     )
 
 
@@ -492,7 +491,8 @@ def main() -> None:
     body, n_images = process_content(raw, media_dir, md_dir)
     print(f"  {n_images} image(s) downloaded", file=sys.stderr)
 
-    fm = build_frontmatter(meta, source_url, doc_id, args.uploaded_by)
+    fm = build_frontmatter(meta, source_url, doc_id, args.uploaded_by,
+                           topic_slug=md_path.stem, area=target_dir)
     full = fm + body
 
     md_path.write_text(full, encoding="utf-8")
