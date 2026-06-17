@@ -24,6 +24,11 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import Any
+
+import yaml
+
+from .frontmatter import make_frontmatter
 
 DEFAULT_TARGET_DIR = "ops"  # overridden per-repo via --target-dir / Claude
 MODEL_NAME = "BAAI/bge-small-zh-v1.5"
@@ -95,19 +100,342 @@ def load_corpus_chunks() -> list[Chunk]:
     return out
 
 
+LARK_BASE = ["lark-cli", "--profile", "kb-bot"]
+WIKI_RE = re.compile(r"/wiki/([A-Za-z0-9]+)")
+SHEETS_RE = re.compile(r"/sheets/([A-Za-z0-9]+)")
+DOCX_RE = re.compile(r"/(?:docx|docs|doc)/([A-Za-z0-9]+)")
+MAX_SHEET_ROWS = 5000  # per-tab safety cap so a runaway sheet can't hang ingest
+
+
+def _col_letter(n: int) -> str:
+    """1-based column index to A1 letters: 1->A, 26->Z, 27->AA, 30->AD."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s or "A"
+
+
+def _lark(args: list[str]) -> dict:
+    """Run a lark-cli subcommand and return parsed JSON. lark-cli exits non-zero
+    on API errors but still prints the JSON error envelope to stdout, so parse
+    stdout regardless of return code and let the caller inspect ok/code/error
+    (this lets callers turn e.g. a missing-scope error into actionable help).
+    Only hard-exit when there's no JSON to inspect at all."""
+    r = subprocess.run(LARK_BASE + args, capture_output=True, text=True, check=False)
+    # On success the envelope lands on stdout; on API errors lark-cli exits
+    # non-zero and writes the {ok:false,error:...} envelope to stderr instead.
+    for stream in (r.stdout, r.stderr):
+        if not stream.strip():
+            continue
+        try:
+            return json.loads(stream)
+        except json.JSONDecodeError:
+            continue
+    sys.exit(f"lark-cli {' '.join(args)} failed:\n{r.stderr or r.stdout}")
+
+
+def _resolve_url(url: str) -> tuple[str, str]:
+    """Resolve a Feishu URL to (obj_type, token).
+
+    obj_type is Feishu's object type ('docx', 'sheet', 'bitable', ...). Wiki
+    URLs wrap an underlying object, so they're resolved through the wiki node
+    API to find the real obj_type/obj_token (a /wiki/ link can point at a docx,
+    a sheet, a bitable, etc.). For direct /docx/ and /sheets/ links the token in
+    the path is the object token itself.
+    """
+    m = WIKI_RE.search(url)
+    if m:
+        data = _lark(["api", "GET", "/open-apis/wiki/v2/spaces/get_node",
+                      "--params", json.dumps({"token": m.group(1)}), "--as", "bot"])
+        node = (data.get("data") or {}).get("node")
+        if data.get("code") not in (0, None) or not node:
+            sys.exit(f"wiki node resolve failed: {data.get('msg') or data.get('error')}")
+        return node["obj_type"], node["obj_token"]
+    m = SHEETS_RE.search(url)
+    if m:
+        return "sheet", m.group(1)
+    m = DOCX_RE.search(url)
+    if m:
+        return "docx", m.group(1)
+    return "docx", url  # unknown shape: let docx fetch resolve / error
+
+
 def fetch_doc(url: str) -> dict:
+    """Fetch a Feishu doc as markdown. Supports docx (native or wiki-wrapped)
+    and sheet (every tab rendered as a markdown table). Returns the uniform
+    shape {content, document_id} the rest of the pipeline expects, where
+    content begins with a <title>…</title> line."""
+    obj_type, token = _resolve_url(url)
+    if obj_type == "sheet":
+        return fetch_sheet(token)
+    # docx and everything else: docs +fetch resolves wiki wrappers itself, so
+    # pass the original URL through unchanged.
     cmd = [
-        "lark-cli", "--profile", "kb-bot", "docs", "+fetch",
-        "--api-version", "v2", "--doc", url, "--as", "bot",
+        "docs", "+fetch", "--api-version", "v2", "--doc", url, "--as", "bot",
         "--doc-format", "markdown",
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if r.returncode != 0:
-        sys.exit(f"lark-cli fetch failed: {r.stderr or r.stdout}")
-    data = json.loads(r.stdout)
+    data = _lark(cmd)
     if not data.get("ok"):
         sys.exit(f"fetch error: {data.get('error')}")
     return data["data"]["document"]
+
+
+def _sheet_scope_exit(error: Any) -> None:
+    """Sheet read failed: turn Feishu's opaque scope error into actionable help."""
+    msg = error.get("message", "") if isinstance(error, dict) else str(error)
+    code = error.get("code") if isinstance(error, dict) else None
+    blob = f"{code} {msg}".lower()
+    if code == 99991672 or "scope" in blob or "permission" in blob:
+        sys.exit(
+            "读取电子表格失败：kb-bot 飞书应用缺少电子表格读取权限。\n"
+            "请在飞书开发者后台为该自建应用开通 scope `sheets:spreadsheet:readonly`"
+            "（开通后需发布新版本生效），再重新发送链接。\n"
+            f"(原始错误: {msg})"
+        )
+    sys.exit(f"读取电子表格失败: {msg}")
+
+
+def _values_to_markdown(values: list) -> str:
+    """Render a 2D cell array as a GitHub-flavored markdown table. First
+    non-empty row becomes the header. Empty trailing rows/cols are dropped."""
+    rows = [["" if c is None else str(c) for c in (r or [])] for r in (values or [])]
+    rows = [r for r in rows if any(cell.strip() for cell in r)]
+    if not rows:
+        return "*(空表)*"
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    # Drop fully-empty columns: wide grids carry many blank columns that are pure
+    # noise once flattened to markdown (and inflate the embedded text).
+    keep = [i for i in range(width) if any(r[i].strip() for r in rows)]
+    if keep:
+        rows = [[r[i] for i in keep] for r in rows]
+
+    def esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
+    out = [
+        "| " + " | ".join(esc(c) for c in rows[0]) + " |",
+        "| " + " | ".join("---" for _ in rows[0]) + " |",
+    ]
+    for r in rows[1:]:
+        out.append("| " + " | ".join(esc(c) for c in r) + " |")
+    return "\n".join(out)
+
+
+PAGE = 200  # lark-cli returns at most ~200 rows per +read call
+
+
+def _read_range(token: str, rng: str) -> tuple[list, str]:
+    """One +read call. Returns (values, echoed_range). Cell values live under
+    data.valueRange.{values,range} (camelCase, no truncated/total_rows fields)."""
+    rd = _lark(["sheets", "+read", "--spreadsheet-token", token, "--range", rng,
+                "--value-render-option", "ToString", "--as", "bot"])
+    if not rd.get("ok"):
+        _sheet_scope_exit(rd.get("error"))
+    vr = (rd.get("data") or {}).get("valueRange") or {}
+    return list(vr.get("values") or []), vr.get("range") or ""
+
+
+def _read_tab_rows(token: str, sid: str, row_count: int, col_count: int) -> tuple[list, bool]:
+    """Read all rows of one tab in <=PAGE-row windows. Always uses explicit
+    "<sheetId>!A1:<col><row>" ranges: a bare sheetId that looks like A1 notation
+    (e.g. 'PKSQ42') is otherwise misparsed by lark-cli as a cell reference. Reads
+    up to the tab's grid row_count (capped at MAX_SHEET_ROWS), stopping early at
+    the first all-empty window. Trailing empty rows are dropped when rendering.
+    Returns (values, capped)."""
+    last_col = _col_letter(col_count or 1)
+    limit = min(row_count or MAX_SHEET_ROWS, MAX_SHEET_ROWS)
+    rows: list = []
+    start = 1
+    while start <= limit:
+        end = min(start + PAGE - 1, limit)
+        vals, _ = _read_range(token, f"{sid}!A{start}:{last_col}{end}")
+        if not any(any((c not in (None, "")) for c in (r or [])) for r in vals):
+            break  # an all-empty window means we're past the real data
+        rows.extend(vals)
+        start = end + 1
+    return rows, (row_count or 0) > limit
+
+
+def fetch_sheet(token: str) -> dict:
+    """Read every tab of a spreadsheet and render it as markdown tables, in the
+    same {content, document_id} shape as a docx fetch so downstream ingest code
+    (title extraction, image scan, dedup, frontmatter) stays type-agnostic.
+    All tabs are read; each tab is paginated to its full row count."""
+    info = _lark(["sheets", "+info", "--spreadsheet-token", token, "--as", "bot"])
+    if not info.get("ok"):
+        _sheet_scope_exit(info.get("error"))
+    data = info.get("data") or {}
+    # lark-cli wraps both under an extra key: data.spreadsheet.spreadsheet.title
+    # and data.sheets.sheets[]. Unwrap defensively so a flatter future shape
+    # still works.
+    sp = data.get("spreadsheet") or {}
+    if isinstance(sp.get("spreadsheet"), dict):
+        sp = sp["spreadsheet"]
+    title = sp.get("title") or "电子表格"
+    sheets = data.get("sheets") or []
+    if isinstance(sheets, dict):
+        sheets = sheets.get("sheets") or []
+
+    parts = [f"<title>{title}</title>", ""]
+    for sh in sheets:
+        sid = sh.get("sheet_id") or sh.get("sheetId")
+        tab = sh.get("title") or sid
+        if not sid or sh.get("hidden"):
+            continue
+        gp = sh.get("grid_properties") or {}
+        row_count = gp.get("row_count") or gp.get("rowCount") or 0
+        col_count = gp.get("column_count") or gp.get("columnCount") or 26
+        values, capped = _read_tab_rows(token, sid, row_count, col_count)
+        if len(sheets) > 1:
+            parts.append(f"## {tab}")
+            parts.append("")
+        parts.append(_values_to_markdown(values))
+        if capped:
+            parts.append(f"\n*（表「{tab}」行数超过 {MAX_SHEET_ROWS} 行上限，仅含前 {len(values)} 行）*")
+        parts.append("")
+    return {"content": "\n".join(parts).rstrip() + "\n", "document_id": f"sheet:{token}"}
+
+
+SHEET_DISTILL_MODEL = "claude-opus-4-7"
+
+SHEET_DISTILL_PROMPT = """\
+你在为一个用于**语义检索（RAG）**的知识库整理资料。下面是从飞书电子表格《{title}》\
+导出的原始内容，每个工作表（tab）渲染成了一张 markdown 表格。
+
+原始表格直接入库检索效果很差：空单元格、合并单元格碎片、宽表布局都是噪声，按字符\
+切块还会把表头和数据切散、丢失语义。你的任务是把表格里的**信息**提炼成一篇结构化的\
+中文知识文档，让每条信息都成为**自包含、可被独立检索命中**的陈述。
+
+要求：
+- 忠实转写，**不编造、不遗漏**任何有效信息（指标定义、计算/研发逻辑、口径、字段含义、\
+查询条件、规则、已知问题、备注等都要保留）。
+- 把表格的行列关系还原成完整句子。例：不要写「待分拣 | 见概况」，要写\
+「『待分拣』指标：定义见『概况』工作表；…（把该行其它列的信息也并入）」。
+- 按表格自身的工作表/分区组织成小节，用 `##` / `###` 标题；同类条目可归并。
+- 丢弃纯空白、纯排版、无信息量的内容；不要保留原始表格。
+- 保留具体的名称、条件、公式、字段名、数值口径等关键细节，不要泛化成空话。
+- 看不懂或语义不明的内容，原样保留并标注「（原文，含义待确认）」，不要臆测。
+- 只输出整理后的 markdown 正文，**不要**输出 `<title>` 行、不要加任何前言或说明。
+
+原始内容如下：
+
+{body}
+"""
+
+
+def distill_sheet(title: str, raw_content: str) -> str:
+    """Turn a spreadsheet's raw markdown tables into retrieval-friendly knowledge
+    prose. Raw tables embed and chunk badly (empty cells, merged-cell fragments,
+    headers split from data); this rewrites the *information* as self-contained
+    statements. Returns markdown beginning with the <title> line, ready to take
+    the place of the raw body. Falls back to the raw content if Claude fails."""
+    from anthropic import Anthropic
+
+    api_key = os.environ.get("AGENT_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        sys.exit("missing AGENT_ANTHROPIC_API_KEY (see ~/.claude/secrets/anthropic.env)")
+    body = TITLE_RE.sub("", raw_content, count=1).lstrip()
+    try:
+        resp = Anthropic(api_key=api_key).messages.create(
+            model=SHEET_DISTILL_MODEL,
+            max_tokens=16000,
+            messages=[{"role": "user",
+                       "content": SHEET_DISTILL_PROMPT.format(title=title, body=body)}],
+        )
+        distilled = "".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ).strip()
+    except Exception as e:
+        print(f"  ⚠️ 表格提炼失败，回退原始表格: {e}", file=sys.stderr)
+        return raw_content
+    if not distilled:
+        print("  ⚠️ 表格提炼返回空，回退原始表格", file=sys.stderr)
+        return raw_content
+    return f"<title>{title}</title>\n\n{distilled}\n"
+
+
+def split_frontmatter(text: str) -> tuple[dict, str]:
+    """Return (frontmatter_dict, body) for a corpus markdown file."""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}, text
+    try:
+        fm = yaml.safe_load(text[3:end]) or {}
+    except yaml.YAMLError:
+        fm = {}
+    return (fm if isinstance(fm, dict) else {}), text[end + 4:].lstrip()
+
+
+def _source_doc_id(source_field: str) -> str:
+    """Pull the doc_id out of a frontmatter source string like
+    'https://… (doc_id=sheet:XXX)' or 'file:… (doc_id=file:abc)'."""
+    m = re.search(r"doc_id=([^\s)]+)", source_field or "")
+    return m.group(1) if m else ""
+
+
+_LEVEL_RANK = {"public": 0, "internal": 1, "confidential": 2}
+
+
+def _max_level(a: str | None, b: str | None) -> str:
+    """Return the more sensitive of two levels (never downgrade on merge)."""
+    ra, rb = _LEVEL_RANK.get(a or "", 1), _LEVEL_RANK.get(b or "", 1)
+    return a if ra >= rb else b
+
+
+MERGE_PROMPT = """\
+你在维护一个用于语义检索的知识库。下面有一篇**已有知识文档**和一条**新的更新**\
+（来自同主题的另一份资料），二者被判定为同一主题、新内容是对旧文档的更新/扩展。
+
+请把它们合并成一篇文档，规则：
+- 整合新信息；新内容明确取代旧说法的，用新的、删掉过时的。
+- **保留**旧文档里仍然有效、新内容未涉及的所有信息，不要丢。
+- **真正的口径冲突**（同一件事，新旧给出不同定义/数值/做法且无法判断谁对）：\
+**不要静默二选一**。两个版本都保留，在该处用 `> ⚠️ 口径冲突（待人工确认）：旧=…；新=…` 显式标注。
+- 保持适合检索的结构（小标题、自包含陈述句），不要无谓改写没冲突的内容。
+- 不编造、不臆测。
+
+只返回一个 JSON 对象（不要任何额外文字），字段：
+- body: 合并后的 markdown 正文（不含 frontmatter、不含 <title> 行）
+- summary: 1-3 句中文摘要
+- key_points: 3-5 条要点（字符串数组，不带前导符号）
+- conflicts: 数组，每个元素 {{"point":"冲突的点","existing":"旧口径","new":"新口径"}}；无冲突则为空数组
+
+【已有知识文档】标题：{title}
+{existing}
+
+【新的更新】
+{new}
+"""
+
+
+def merge_docs(title: str, existing_body: str, new_body: str) -> dict:
+    """Merge a new update into an existing doc body via Claude. Returns
+    {body, summary, key_points, conflicts}. Raises on hard failure so the caller
+    can refuse to write (we must never silently drop the existing content)."""
+    from anthropic import Anthropic
+
+    api_key = os.environ.get("AGENT_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        sys.exit("missing AGENT_ANTHROPIC_API_KEY (see ~/.claude/secrets/anthropic.env)")
+    resp = Anthropic(api_key=api_key).messages.create(
+        model=SHEET_DISTILL_MODEL,
+        max_tokens=16000,
+        messages=[{"role": "user", "content": MERGE_PROMPT.format(
+            title=title, existing=existing_body, new=new_body)}],
+    )
+    text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        sys.exit(f"merge: claude returned no JSON: {text[:400]}")
+    data = json.loads(m.group(0))
+    if not data.get("body"):
+        sys.exit("merge: claude returned empty body; refusing to overwrite existing doc")
+    data.setdefault("conflicts", [])
+    return data
 
 
 def extract_title(content: str) -> str:
@@ -345,7 +673,8 @@ def list_target_subdirs() -> list[str]:
 
 
 def build_frontmatter(meta: dict, source_url: str, source_doc_id: str,
-                      uploaded_by: str, *, topic_slug: str = "", area: str = "") -> str:
+                      uploaded_by: str, *, topic_slug: str = "", area: str = "",
+                      learned_date: str | None = None) -> str:
     from .frontmatter import make_frontmatter
     src = source_url
     if source_doc_id:
@@ -360,6 +689,7 @@ def build_frontmatter(meta: dict, source_url: str, source_doc_id: str,
         key_points=meta.get("key_points") or [],
         source=src,
         uploaded_by=uploaded_by,
+        learned_date=learned_date,
     )
 
 
@@ -422,6 +752,12 @@ def main() -> None:
         doc_id = doc["document_id"]
         title_hint = extract_title(raw)
         source_url = args.url
+        # Spreadsheets are stored as distilled knowledge prose, not raw tables:
+        # raw tables embed/chunk poorly for retrieval. Done before dedup + meta so
+        # those run on the same high-quality text that gets stored.
+        if doc_id.startswith("sheet:"):
+            print("→ Distilling spreadsheet into knowledge prose (Claude)...", file=sys.stderr)
+            raw = distill_sheet(title_hint, raw)
     slug = slugify(title_hint)
 
     print(f"→ Title: {title_hint!r}; slug={slug}", file=sys.stderr)
@@ -449,20 +785,44 @@ def main() -> None:
     print(f"  decision: {meta['dedup_decision']} ({meta.get('dedup_reason', '')})", file=sys.stderr)
     print(f"  level: {meta.get('level', 'internal')}", file=sys.stderr)
 
-    target_dir = args.target_dir or meta.get("target_subdir") or DEFAULT_TARGET_DIR
-    md_dir = KNOWLEDGE / target_dir
-    md_dir.mkdir(parents=True, exist_ok=True)
+    # "update_of" writes into the existing file in place rather than dropping a
+    # second numbered file next to it (which would pile up 42_/43_/44_ dupes).
+    # HOW it writes depends on whether it's the SAME source doc:
+    #   - same source (re-fetch of the same sheet/docx) → overwrite: the new
+    #     content is the authoritative complete version.
+    #   - different source (e.g. a Scout Q&A card extending an existing topic
+    #     file) → MERGE: blindly overwriting would wipe the target down to just
+    #     the new card. We must combine and flag any 口径 conflicts.
+    update_target = None
+    update_mode = None  # None | "overwrite" | "merge"
+    existing_fm: dict = {}
+    if meta["dedup_decision"] == "update_of" and meta.get("dedup_target"):
+        cand = KNOWLEDGE / meta["dedup_target"]
+        if cand.is_file():
+            update_target = cand
+            existing_fm, _ = split_frontmatter(cand.read_text(encoding="utf-8"))
+            old_id = _source_doc_id(str(existing_fm.get("source", "")))
+            update_mode = "overwrite" if (old_id and old_id == doc_id) else "merge"
 
-    # Auto-prepend business-line numbered prefix (e.g. '16_' for the 7th file
-    # in 1x_收派作业). Skips if target_dir doesn't match the <N>x_ pattern.
-    seq_prefix = next_line_seq(md_dir)
-    fname_core = f"{seq_prefix}_{slug}" if seq_prefix else slug
+    if update_target is not None:
+        md_path = update_target
+        md_dir = md_path.parent
+        target_dir = str(md_dir.relative_to(KNOWLEDGE))
+    else:
+        target_dir = args.target_dir or meta.get("target_subdir") or DEFAULT_TARGET_DIR
+        md_dir = KNOWLEDGE / target_dir
+        md_dir.mkdir(parents=True, exist_ok=True)
 
-    md_path = md_dir / f"{fname_core}.md"
-    if md_path.exists() and meta["dedup_decision"] == "new":
-        md_path = md_dir / f"{fname_core}_{date.today().isoformat()}.md"
-    if meta["dedup_decision"] == "conflict_with":
-        md_path = md_dir / f"_conflict_{fname_core}_{date.today().isoformat()}.md"
+        # Auto-prepend business-line numbered prefix (e.g. '16_' for the 7th file
+        # in 1x_收派作业). Skips if target_dir doesn't match the <N>x_ pattern.
+        seq_prefix = next_line_seq(md_dir)
+        fname_core = f"{seq_prefix}_{slug}" if seq_prefix else slug
+
+        md_path = md_dir / f"{fname_core}.md"
+        if md_path.exists() and meta["dedup_decision"] == "new":
+            md_path = md_dir / f"{fname_core}_{date.today().isoformat()}.md"
+        if meta["dedup_decision"] == "conflict_with":
+            md_path = md_dir / f"_conflict_{fname_core}_{date.today().isoformat()}.md"
 
     if args.dry_run:
         # Emit structured proposal so callers (kb-bot) can render previews
@@ -475,6 +835,7 @@ def main() -> None:
             "decision": meta["dedup_decision"],
             "decision_reason": meta.get("dedup_reason", ""),
             "dedup_target": meta.get("dedup_target"),
+            "update_mode": update_mode,
             "max_similarity": dedup["max_score"],
             "tags": meta["tags"],
             "level": meta.get("level", "internal"),
@@ -491,8 +852,40 @@ def main() -> None:
     body, n_images = process_content(raw, media_dir, md_dir)
     print(f"  {n_images} image(s) downloaded", file=sys.stderr)
 
-    fm = build_frontmatter(meta, source_url, doc_id, args.uploaded_by,
-                           topic_slug=md_path.stem, area=target_dir)
+    conflicts: list = []
+    if update_mode == "merge":
+        # Different source updating an existing topic file: merge instead of
+        # overwrite so the target's existing knowledge isn't wiped, and surface
+        # any 口径 conflicts rather than silently resolving them.
+        print(f"→ Merging into existing {md_path.name} (Claude)...", file=sys.stderr)
+        _, existing_body = split_frontmatter(md_path.read_text(encoding="utf-8"))
+        merged = merge_docs(meta["title"], existing_body, body)
+        conflicts = merged.get("conflicts") or []
+        body = merged["body"].rstrip() + "\n"
+        today = date.today().isoformat()
+        fm = make_frontmatter(
+            title=existing_fm.get("title") or meta["title"],
+            topic_slug=md_path.stem,
+            area=target_dir,
+            tags=sorted(set(existing_fm.get("tags") or []) | set(meta.get("tags") or [])),
+            level=_max_level(existing_fm.get("level"), meta.get("level")),
+            summary=merged.get("summary") or meta.get("summary", ""),
+            key_points=merged.get("key_points") or meta.get("key_points") or [],
+            source=str(existing_fm.get("source", "")) or source_url,
+            uploaded_by=existing_fm.get("uploaded_by") or args.uploaded_by,
+            learned_date=str(existing_fm.get("learned_date") or today),
+            last_updated=today,
+            sources=(existing_fm.get("sources") or [])
+            + [{"file": source_url or doc_id, "distilled_at": today}],
+            it_actions=existing_fm.get("it_actions"),
+        )
+        print(f"  merged; {len(conflicts)} 口径 conflict(s) flagged", file=sys.stderr)
+    else:
+        # "new", "conflict_with", or same-source "update_of" overwrite. Preserve
+        # the original creation date when overwriting an existing file.
+        fm = build_frontmatter(meta, source_url, doc_id, args.uploaded_by,
+                               topic_slug=md_path.stem, area=target_dir,
+                               learned_date=str(existing_fm.get("learned_date") or "") or None)
     full = fm + body
 
     md_path.write_text(full, encoding="utf-8")
@@ -506,7 +899,8 @@ def main() -> None:
         f"learn: {meta['title']} (from {args.uploaded_by})\n\n"
         f"source: {source_url}\n"
         f"dedup: {meta['dedup_decision']}"
-        + (f" → {meta['dedup_target']}" if meta.get("dedup_target") else "")
+        + (f" → {meta['dedup_target']} ({update_mode})" if meta.get("dedup_target") else "")
+        + (f"\nconflicts flagged: {len(conflicts)}" if conflicts else "")
     )
     git_commit(REPO, files_to_commit, commit_msg)
     print(json.dumps({
@@ -514,6 +908,8 @@ def main() -> None:
         "path": str(md_path.relative_to(REPO)),
         "decision": meta["dedup_decision"],
         "dedup_target": meta.get("dedup_target"),
+        "update_mode": update_mode,
+        "conflicts": conflicts,
         "max_similarity": dedup["max_score"],
         "n_images": n_images,
         "tags": meta["tags"],

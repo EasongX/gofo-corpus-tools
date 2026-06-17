@@ -19,6 +19,21 @@ Fields (order is stable for clean diffs):
   summary       1-3 sentence summary (REQUIRED, never empty)
   key_points    list[str] (REQUIRED, never empty)
   sources       optional list of {file, distilled_at} — only distill sets this
+  it_actions    optional list of machine-readable IT-action markers (埋点)
+
+it_actions —— IT 动作埋点（对答疑机器人透明，给执行机器人读）
+  正文照常用自然语言写「这事 IT 来做：…」，答疑检索器（lark-qa-bot）只白
+  名单提取 title/summary/key_points/tags，**不读 it_actions**，所以现有问答
+  完全不受影响。有执行能力的机器人则解析 it_actions，命中场景时直接执行，
+  而不是回复"找 IT"。每个条目结构：
+    - trigger: 触发场景（一句话，自然语言）
+      skill:   对应可执行能力 ID（如 lib/dms_client 映射的
+               dms_operation__users__permission_add）
+      params:  动作参数（占位用 <...> 表示运行时填充）
+      risk:    low | medium | high
+      confirm: bool，高风险动作执行前是否需人工确认
+      revoke:  可选，事后回收/收尾动作说明
+  纯信息类、无 IT 可执行动作的条目不带该字段。
 """
 from __future__ import annotations
 
@@ -47,6 +62,7 @@ def make_frontmatter(
     learned_date: str | None = None,
     last_updated: str | None = None,
     sources: list[dict] | None = None,
+    it_actions: list[dict] | None = None,
 ) -> str:
     """Build a canonical frontmatter block (including the trailing '---\\n\\n')."""
     today = date.today().isoformat()
@@ -77,5 +93,15 @@ def make_frontmatter(
         for s in sources:
             lines.append(f"  - file: {_yaml_str(s.get('file', ''))}")
             lines.append(f"    distilled_at: {s.get('distilled_at', today)}")
+    if it_actions:
+        lines.append("it_actions:")
+        for a in it_actions:
+            lines.append(f"  - trigger: {_yaml_str(a.get('trigger', ''))}")
+            lines.append(f"    skill: {_yaml_str(a.get('skill', ''))}")
+            lines.append(f"    params: {json.dumps(a.get('params', {}), ensure_ascii=False)}")
+            lines.append(f"    risk: {a.get('risk', 'medium')}")
+            lines.append(f"    confirm: {str(bool(a.get('confirm', True))).lower()}")
+            if a.get("revoke"):
+                lines.append(f"    revoke: {_yaml_str(a['revoke'])}")
     lines.append("---")
     return "\n".join(lines) + "\n\n"
